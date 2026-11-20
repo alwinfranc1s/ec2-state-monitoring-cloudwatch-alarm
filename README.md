@@ -24,35 +24,101 @@ region is `us-east-1`; set `TF_VAR_aws_region` to use another region and
 `TF_VAR_cpu_threshold` to override the threshold. Terraform state and saved
 plans can contain the email address, so keep them private.
 
-Click **Confirm subscription** in the AWS SNS email **before** generating load.
-CloudWatch sends the notification when the alarm enters `ALARM`; confirming
-the subscription after that transition won't replay the alert.
+## Set up the AWS CLI
+
+Use AWS CLI v2 with credentials for the same AWS account as the deployment.
+The CLI identity needs `sns:ConfirmSubscription`, `ssm:DescribeInstanceInformation`,
+`ssm:SendCommand`, `ssm:GetCommandInvocation`, `cloudwatch:DescribeAlarms`,
+and `cloudwatch:DescribeAlarmHistory`.
+
+In Bash, load the deployment identifiers and region (or set these variables
+directly if you already know the values):
+
+```bash
+INSTANCE_ID=$(terraform output -raw instance_id)
+CPU_ALARM_NAME=$(terraform output -raw cpu_alarm_name)
+SNS_TOPIC_ARN=$(terraform output -raw sns_topic_arn)
+AWS_REGION=$(terraform output -raw aws_region)
+export AWS_REGION
+export AWS_PAGER=""
+```
+
+Before generating load, copy the `Token` query parameter value from the
+**Confirm subscription** link in the SNS email. You don't need to open the link.
+Paste the token when prompted and check that the command returns a subscription
+ARN:
+
+```bash
+read -r -s -p 'SNS confirmation token: ' SNS_TOKEN
+printf '\n'
+aws sns confirm-subscription --topic-arn "$SNS_TOPIC_ARN" --token "$SNS_TOKEN" \
+  --query 'SubscriptionArn' --output text
+unset SNS_TOKEN
+```
+
+CloudWatch sends the email when the alarm enters `ALARM`; confirming the
+subscription after that transition won't replay the alert.
 
 ## Generate a CPU spike
 
-1. In the AWS console for the deployment region, open **Systems Manager → Run
-   Command**. Choose **Run command** and select `AWS-RunShellScript`. Target
-   the instance ID shown by `terraform output -raw instance_id`. If the
-   instance isn't listed yet, wait a few minutes for it to register. Your
-   console identity also needs permission to send and view Run Command commands.
-2. Paste the command below into **Commands** and run it once. It starts one
-   CPU worker per vCPU for ten minutes and cleans them up automatically.
+Check that Systems Manager reports the instance as `Online`. If it isn't
+listed yet, wait a few minutes and try again.
 
-   ```sh
-   timeout --kill-after=5s 10m bash -c '
-     workers=$(nproc)
-     for ((i = 0; i < workers; i++)); do
-       yes >/dev/null &
-     done
-     wait
-   ' || [ "$?" -eq 124 ]
-   ```
+```bash
+aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+  --query 'InstanceInformationList[0].PingStatus' --output text
+```
 
-3. In **CloudWatch → Alarms**, open the alarm shown by
-   `terraform output -raw cpu_alarm_name`. Check that it moves to `ALARM`
-   and that the email arrives. Allow several minutes for metric delivery and
-   evaluation. After the workers stop, the alarm should return to `OK` as
-   below-threshold data arrives.
+Send the command once. It runs one CPU worker per vCPU for ten minutes and
+stops them automatically.
+
+```bash
+COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters "$(cat <<'JSON'
+{
+  "commands": [
+    "timeout --kill-after=5s 10m bash -c '",
+    "  workers=$(nproc)",
+    "  for ((i = 0; i < workers; i++)); do",
+    "    yes >/dev/null &",
+    "  done",
+    "  wait",
+    "' || [ \"$?\" -eq 124 ]"
+  ]
+}
+JSON
+)" --query 'Command.CommandId' --output text)
+printf 'Run Command ID: %s\n' "$COMMAND_ID"
+```
+
+Check the command status. If it returns `InvocationDoesNotExist`, retry
+after a few seconds while Systems Manager records the invocation.
+
+```bash
+aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+  --query '{Status:Status,ExitCode:ResponseCode,Errors:StandardErrorContent}' --output json
+```
+
+## Monitor the CloudWatch alarm
+
+Check the alarm's current state and the reason for its last transition:
+
+```bash
+aws cloudwatch describe-alarms --alarm-names "$CPU_ALARM_NAME" \
+  --query 'MetricAlarms[].{State:StateValue,Since:StateTransitionedTimestamp,Reason:StateReason}' \
+  --output json
+```
+
+Allow several minutes for the alarm to enter `ALARM` and for the email to
+arrive. After the workers stop, the alarm should return to `OK` as
+below-threshold metrics arrive. If you miss a transition, check the history:
+
+```bash
+aws cloudwatch describe-alarm-history --alarm-name "$CPU_ALARM_NAME" \
+  --history-item-type StateUpdate --max-items 5 \
+  --query 'AlarmHistoryItems[].{Time:Timestamp,Change:HistorySummary}' --output table
+```
 
 ## Clean up
 
