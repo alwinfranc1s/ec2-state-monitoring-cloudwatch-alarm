@@ -20,7 +20,7 @@ terraform apply demo.tfplan
 ```
 
 Enter the notification address when prompted for `alert_email`. The default
-region is `us-east-1`; set `TF_VAR_aws_region` to use another region and
+region is `ap-south-1`; set `TF_VAR_aws_region` to use another region and
 `TF_VAR_cpu_threshold` to override the threshold. Terraform state and saved
 plans can contain the email address, so keep them private.
 
