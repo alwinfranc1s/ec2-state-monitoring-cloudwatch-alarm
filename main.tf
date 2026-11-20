@@ -10,7 +10,7 @@ terraform {
 variable "aws_region" {
   description = "AWS region containing a default VPC and at least one default subnet."
   type        = string
-  default     = "us-east-1"
+  default     = "ap-south-1"
 }
 
 variable "alert_email" {
